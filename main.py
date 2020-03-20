@@ -1,16 +1,89 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import concurrent.futures
 import sys
 import time
 from collections import Counter, namedtuple
 from enum import Enum
 
+import aiohttp
 import requests
 from tqdm import tqdm
 
 Result = namedtuple('Result', 'status link')
 HTTPStatus = Enum('Status', 'ok not_found error')
+
+
+class FetchError(Exception):
+    def __init__(self, link):
+        self.link = link
+
+
+async def test_link_async(session, link, semaphore, verbose):
+    try:
+        async with semaphore:
+            res = await session.get(link)
+            if res.status == 200:
+                status = HTTPStatus.ok
+                msg = 'ok'
+            elif res.status == 404:
+                status = HTTPStatus.not_found
+                msg = 'not found'
+            else:
+                raise aiohttp.ClientError(code=res.status,
+                                          message=res.reason,
+                                          headers=res.headers)
+    except Exception as exc:
+        raise FetchError(link) from exc
+
+    if verbose:
+        print(link, msg)
+
+    return Result(status, link)
+
+
+async def test_links_coro(links, verbose, concur_req):
+    counter = Counter()
+    collection = {status: list() for status in HTTPStatus}
+    semaphore = asyncio.Semaphore(concur_req)
+    async with aiohttp.ClientSession() as session:
+        todo = [
+            test_link_async(session, link, semaphore, verbose)
+            for link in links
+        ]
+        todo_iter = asyncio.as_completed(todo)
+        if not verbose:
+            todo_iter = tqdm(todo_iter, total=len(links))
+        for future in todo_iter:
+            try:
+                res = await future
+            except FetchError as exc:
+                link = exc.link
+                try:
+                    error_msg = exc.__cause__.args[0]
+                except IndexError:
+                    error_msg = exc.__cause__.__class__.__name__
+                if verbose and error_msg:
+                    msg = '*** Error for {}: {}'
+                    print(msg.format(link, error_msg))
+                status = HTTPStatus.error
+            else:
+                link = res.link
+                status = res.status
+
+            collection[status].append(link)
+            counter[status] += 1
+    return counter, collection
+
+
+def test_links_async(links, verbose, concur_req):
+    loop = asyncio.get_event_loop()
+    coro = test_links_coro(links, verbose, concur_req)
+    # return asyncio.run(test_links_coro(links, verbose, concur_req))
+    counter, collection = loop.run_until_complete(coro)
+    loop.close()
+    return counter, collection
 
 
 def final_report(links, counter, start_time):
@@ -28,12 +101,6 @@ def final_report(links, counter, start_time):
 def get_args():
     parser = argparse.ArgumentParser(description='检查链接音源是否还可以播放',
                                      epilog='加班快乐👷')
-    # parser.add_argument('-l',
-    #                     '--length',
-    #                     help='忽略能访问，但是Content-Length小于该值的连接',
-    #                     type=int,
-    #                     action='store',
-    #                     default=100)
     parser.add_argument('-n',
                         '--num',
                         help='并发连接数',
@@ -49,12 +116,9 @@ def get_args():
     args = parser.parse_args()
     links = []
 
-    if args.num < 2:
-        print('最少要2个并发吧')
+    if args.num < 10:
+        print('最少要10个并发吧')
         sys.exit()
-    # if args.length < 100:
-    #     print('最少100个长度得忽略吧')
-    #     sys.exit()
 
     def chophead(link):
         return link.replace('\ufeff', '')
@@ -68,7 +132,7 @@ def get_args():
     return args, links
 
 
-def test_links(links, verbose=False, max_workers=10):
+def test_many(links, verbose=False, max_workers=10):
     def test_link(link):
         try:
             res = requests.get(link)
@@ -129,7 +193,7 @@ def test_links(links, verbose=False, max_workers=10):
 def main():
     args, links = get_args()
     start_time = time.time()
-    counter, collection = test_links(links, args.verbose, args.num)
+    counter, collection = test_links_async(links, args.verbose, args.num)
     final_report(links, counter, start_time)
     with open('fuck', 'w', encoding='utf8') as fp:
         fp.write('\r\n'.join(collection[HTTPStatus.ok]))
